@@ -434,4 +434,54 @@ public class TypeScriptHandlerTests
 		// Assert — OrdinalIgnoreCase match finds the symbol
 		symbolBuffer.ShouldContain(s => s.Name == "Foo");
 	}
+
+	[Fact]
+	public async Task GivenWindowsStyleBackslashRelativePath_WhenHandled_ThenNormalizesAndMatchesResult()
+	{
+		// Arrange — relativePath uses backslash separators (Windows-style)
+		MockFileSystem fileSystem = new();
+		ITypeScriptBridgeService bridgeService = A.Fake<ITypeScriptBridgeService>();
+		TypeScriptHandler sut = new(fileSystem, new TextSymbolMapper(), bridgeService, NullLogger<TypeScriptHandler>.Instance, CreateConfigService());
+
+		fileSystem.AddFile("/project/package.json", new("{}"));
+		fileSystem.AddFile("/project/src/foo.ts", new(""));
+
+		TsAnalysisResult analysisResult = new()
+		{
+			ProjectName = "my-app",
+			ProjectRoot = "/project",
+			Files = new()
+			{
+				["src/foo.ts"] = new()
+				{
+					Symbols =
+					[
+						new()
+						{
+							Name = "Foo",
+							Kind = "TypeScriptClass",
+							Class = "class",
+							Fqn = "@my-app/src/foo.ts::Foo",
+							Accessibility = "Public",
+							StartLine = 1,
+							EndLine = 1
+						}
+					],
+					Relationships = []
+				}
+			}
+		};
+		A.CallTo(() => bridgeService.AnalyzeProject(A<string>._)).Returns(analysisResult);
+
+		List<Symbol> symbolBuffer = [];
+		List<Relationship> relBuffer = [];
+
+		// Act — relativePath has backslashes; handler must normalise before bridge lookup
+		await sut.Handle(
+			null, null, "test-repo", "src/foo.ts", "/project/src/foo.ts", @"src\foo.ts",
+			symbolBuffer, relBuffer, Accessibility.NotApplicable);
+
+		// Assert — normalisation succeeded and symbol was found
+		symbolBuffer.ShouldContain(s => s.Name == "Foo");
+	}
 }
