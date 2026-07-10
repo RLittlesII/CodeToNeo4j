@@ -6,13 +6,11 @@ on:
   pull_request:
     branches: [ main ]
 
-permissions:
-  contents: read
-  pull-requests: write
-
 jobs:
   build:
     runs-on: self-hosted
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -61,11 +59,18 @@ jobs:
           flags: dotnet
           fail_ci_if_error: false
 
-      - name: Test Summary PR Comment
-        if: github.event_name == 'pull_request' && always()
+      - name: Collect Test Results
+        if: always()
         uses: actions/github-script@v9
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const script = require('./.github/scripts/test-summary-comment.js')
-            await script({github, context})
+            const script = require('./.github/scripts/collect-test-results.js')
+            await script()
+
+      - name: Upload Test Summary
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-summary
+          path: test-summary.json
+          retention-days: 1
