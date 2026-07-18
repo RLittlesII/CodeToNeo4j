@@ -104,21 +104,16 @@ public class Neo4jFlushService(
 		await using var session = driver.AsyncSession(o => o.WithDatabase(databaseName));
 		await session.ExecuteWriteAsync(async tx =>
 		{
-			List<Task> tasks = [];
-
 			if (symbolBatch.Length > 0)
 			{
-				tasks.Add(tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertSymbols), new { symbols = symbolBatch }));
+				var symbolsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertSymbols), new { symbols = symbolBatch }).ConfigureAwait(false);
+				await symbolsCursor.ConsumeAsync().ConfigureAwait(false);
 			}
 
 			if (relBatch.Length > 0)
 			{
-				tasks.Add(tx.RunWithRetry(cypherService.GetCypher(Queries.MergeRelationships), new { rels = relBatch }));
-			}
-
-			if (tasks.Count > 0)
-			{
-				await Task.WhenAll(tasks).ConfigureAwait(false);
+				var relsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.MergeRelationships), new { rels = relBatch }).ConfigureAwait(false);
+				await relsCursor.ConsumeAsync().ConfigureAwait(false);
 			}
 		}).ConfigureAwait(false);
 

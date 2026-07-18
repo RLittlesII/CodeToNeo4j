@@ -3,6 +3,15 @@
 ## Priority
 **P0 — CRITICAL** (promoted from P3, see `baseline-metrics.md`)
 
+## Implementation Status: FIXED (this session), build verification pending CI
+
+**Files changed**:
+- `src/CodeToNeo4j/Neo4j/Neo4jFlushService.cs` — `FlushSymbols`: replaced the `List<Task>` + `Task.WhenAll` concurrent dispatch with two sequential `await`s, each consuming its cursor via `ConsumeAsync()` before the next query starts. Satisfies AC #1.
+- `src/CodeToNeo4j/Neo4j/Neo4jSchemaService.cs` — `EnsureSchema`: **audit (AC #3) found the same anti-pattern** — `Task.WhenAll(statements.Select(cypher => session.RunWithRetry(cypher)))` ran every schema DDL statement concurrently on one session (session-level, not transaction-level, but the same underlying bolt-protocol violation — a session can only run one query at a time). Fixed to a sequential `foreach` with `ConsumeAsync()` per statement. Also fixed a secondary bug found in the same method: the original `.ContinueWith(async _ => await session.DisposeAsync())` returns a `Task<Task>` that was never awaited, so the session disposal was fire-and-forget; replaced with `await using var session` for deterministic disposal.
+- All other `RunWithRetry` call sites audited (`Neo4jFlushService.FlushFiles`, `UpsertDependencyUrls`, `Neo4jService.cs`'s `MarkFileAsDeleted`/`UpsertCommit`/`UpsertDependencies`/`PurgeData`, `Neo4jSchemaService.VerifyNeo4jVersion`/`UpsertProject`) — all already sequential and/or consume their cursor. No further instances of the bug found. Satisfies AC #3.
+
+**Verification**: Could not run a full `dotnet build`/test pass in this session — the repo pins SDK 10.0.302 via `global.json`, which wasn't installed locally; installing it (to `~/.dotnet`) succeeded, but the sandboxed shell kills any freshly-installed `dotnet` binary on exec (exit 137, even `dotnet --version`) before it can run. Correctness was instead verified by manual review: the replacement pattern (sequential `await` + `cursor.ConsumeAsync()`) is copy-consistent with three other call sites already working in this exact codebase (`Neo4jFlushService.UpsertDependencyUrls`, `Neo4jService.UpsertDependencies`, `Neo4jService.PurgeData`), so no new API surface or unproven pattern was introduced. **AC #2 (repro no longer stalls) and the regression test in AC #5 still need to be run in an environment where the pinned SDK can execute**, before this is considered fully closed.
+
 ## Impact
 This is no longer an opportunistic session-churn cleanup. A live `dotnet-dump` capture during a reproduction of the original stall pattern (`issues/000-baseline-profiling.md`, `baseline-metrics.md`) caught the ingestion pipeline's single flush consumer thread blocked, at the exact moment of a multi-minute stall, inside:
 
