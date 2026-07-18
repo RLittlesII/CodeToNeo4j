@@ -2,7 +2,7 @@
 
 **Priority:** P0 — BLOCKING (gates Issues 001 and 004)
 **Effort:** Low
-**Status:** Prerequisite, not yet run
+**Status:** RUN — see `baseline-metrics.md`. Verdict: Issue 001's CPU-bound quadratic-traversal theory is **refuted** by observed behavior (0% CPU during multi-minute stalls, bursty not sloped progress, zero active thread-pool workers during a stall). Leading new hypothesis: I/O-bound stall, likely Neo4j-side, blocking the flush consumer and backpressuring the whole pipeline via the bounded channel. Issue 001 must be re-scoped before implementation; Issue 004 gains new relevance. Issues 002/003 unaffected, proceed as planned.
 
 ## Problem
 

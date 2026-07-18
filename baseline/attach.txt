@@ -1,0 +1,10 @@
+
+Provider Name                           Keywords            Level               Enabled By
+Microsoft-Windows-DotNETRuntime         0x0000000000000000  Informational(4)    --providers
+
+Process        : /Users/rlittlesii/.dotnet/tools/codetoneo4j
+Output File    : /Users/rlittlesii/source/chaseflorell/CodeToNeo4j-chore-performance/baseline/controls-core-attach.nettrace
+
+Stopping the trace. This may take several minutes depending on the application being traced.
+
+Trace completed.

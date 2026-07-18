@@ -1,0 +1,11 @@
+
+Provider Name                           Keywords            Level               Enabled By
+Microsoft-Windows-DotNETRuntime         0x0000000000000000  Informational(4)    --providers
+
+Launching: codetoneo4j --input /Users/rlittlesii/source/dotnet/maui/src/Controls/src/Core/Controls.Core.csproj --uri bolt://localhost:7687 --password 6rTaJ2gn*fFi 
+Process        : /Users/rlittlesii/.dotnet/tools/codetoneo4j
+Output File    : /Users/rlittlesii/source/chaseflorell/CodeToNeo4j-chore-performance/baseline/controls-core-trace.nettrace
+
+
+Trace completed.
+Process exited with code '1'.
