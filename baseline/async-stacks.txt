@@ -1,0 +1,49 @@
+Captured via: dotnet-dump collect --process-id <pid> (live dump during a stall at 27/2792, second repro run)
+Analyzed via: dotnet-dump analyze <dump> -> dumpasync --coalesce --fields
+Dump file itself was NOT committed/kept (6.5GB full-memory dump, deleted after analysis).
+
+STACKS 1
+[10] 0000000115ab5e20 (1) CodeToNeo4j.Solution.SolutionProcessor+<>c__DisplayClass13_1+<<ProcessSolution>b__1>d
+  [10] 0000000115ab63e8 (1) System.Threading.Tasks.Parallel+<>c__53<CodeToNeo4j.Solution.ProcessedFile>+<<ForEachAsync>b__53_0>d
+
+STACKS 2
+[1] 000000010e9c1078 System.Threading.Tasks.Task<System.Int32>
+  [1] 00000001102dbf00 System.Threading.Tasks.Task+TwoTaskWhenAnyPromise<System.Threading.Tasks.Task<System.Int32>>
+    [1] 00000001102dca40 (2) System.CommandLine.Invocation.InvocationPipeline+<InvokeAsync>d__0
+      [1] 00000001102df078 (0) CodeToNeo4j.Program+<Run>d__5
+        [1] 00000001102e1958 (0) CodeToNeo4j.Program+<Main>d__1
+          [1] 00000001102e25d8 System.Threading.Tasks.Task+SetOnInvokeMres
+
+STACKS 3
+[1] 0000000115aad578 (-4) System.Threading.Channels.ChannelReader<CodeToNeo4j.Solution.SolutionProcessor+ProcessResult>+<ReadAllAsync>d__12
+
+STACKS 4
+[1] 000000010e9bfcc0 System.Threading.Tasks.Task
+  [1] 00000001125d0950 (6) CodeToNeo4j.Solution.SolutionProcessor+<ProcessSolution>d__13
+    [1] 00000001125d0f08 (0) CodeToNeo4j.ProgramOptions.Handlers.SolutionProcessingHandler+<HandleOptions>d__2
+      [1] 00000001102d3730 (0) CodeToNeo4j.ProgramOptions.Handlers.OptionsHandler+<Handle>d__0
+        [1] 00000001102d4458 (0) CodeToNeo4j.ProgramOptions.Handlers.OptionsHandler+<HandleInternal>d__4
+          ... (recursive command-pipeline frames, elided) ...
+                        [1] 00000001102dbf00 System.Threading.Tasks.Task+TwoTaskWhenAnyPromise<System.Threading.Tasks.Task<System.Int32>>
+                          [1] 00000001102dca40 (2) System.CommandLine.Invocation.InvocationPipeline+<InvokeAsync>d__0
+                            [1] 00000001102df078 (0) CodeToNeo4j.Program+<Run>d__5
+                              [1] 00000001102e1958 (0) CodeToNeo4j.Program+<Main>d__1
+                                [1] 00000001102e25d8 System.Threading.Tasks.Task+SetOnInvokeMres
+
+STACKS 5  <-- THE STALL
+[1] 000000011037c568 (0) Neo4j.Driver.Internal.IO.PipelinedMessageReader+<ReadNextMessage>d__12
+  [1] 000000011037ce58 (0) Neo4j.Driver.Internal.IO.PipelinedMessageReader+<ReadAsync>d__9
+    [1] 000000011037d3f0 (0) Neo4j.Driver.Internal.Connector.SocketClient+<ReceiveOneAsync>d__25
+      [1] 00000001104c3ad0 (1) Neo4j.Driver.Internal.Connector.SocketConnection+<ReceiveOneAsync>d__52
+        [1] 00000001104c3f48 (0) Neo4j.Driver.Internal.Connector.DelegatedConnection+<ReceiveOneAsync>d__12
+          [1] 00000001104c3f48 (0) Neo4j.Driver.Internal.Connector.DelegatedConnection+<ReceiveOneAsync>d__12
+            [1] 00000001104c43b0 (2) Neo4j.Driver.Internal.Result.ResultCursorBuilder+<AdvanceAsync>d__33
+              [1] 0000000115724d70 (0) Neo4j.Driver.Internal.Result.ResultCursorBuilder+<ConsumeAsync>d__26
+                [1] 0000000115f88408 (1) Neo4j.Driver.Internal.AsyncTransaction+<DiscardUnconsumed>d__41
+                  [1] 00000001157273b0 (0) Neo4j.Driver.Internal.AsyncTransaction+<CommitAsync>d__30
+                    [1] 00000001156e6fa8 (2) Neo4j.Driver.Internal.AsyncSession+<>c__DisplayClass54_0<System.Int32>+<<RunTransactionAsync>b__1>d
+                      [1] 00000001156e7510 (0) Neo4j.Driver.Internal.AsyncRetryLogic+<RetryAsync>d__9<System.Int32>
+                        [1] 00000001156e7978 (0) Neo4j.Driver.Internal.Logging.DriverLoggerUtil+<TryExecuteAsync>d__1<System.Int32>
+                          [1] 0000000116025f48 (0) CodeToNeo4j.Neo4j.Neo4jFlushService+<FlushSymbols>d__7
+                            [1] 0000000115f86e88 (1) CodeToNeo4j.Solution.SolutionProcessor+<FlushBuffers>d__15
+                              [1] 0000000115aad9c8 (0) CodeToNeo4j.Solution.SolutionProcessor+<RunConsumer>d__14

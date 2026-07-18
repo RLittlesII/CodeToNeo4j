@@ -1,108 +1,112 @@
-# Issue 004: Reuse Neo4j Session Across Flush Cycle
+# Issue 004: Fix Concurrent-Unconsumed-Query Deadlock in Neo4j Flush (rewritten — was "Reuse Neo4j Session Across Flush Cycle")
 
 ## Priority
-**P3 — LOW**
+**P0 — CRITICAL** (promoted from P3, see `baseline-metrics.md`)
 
 ## Impact
-Opportunistic optimization. Reduces Neo4j connection pool churn by ~60% (measured via driver metrics or connection count logs). Not a primary bottleneck, but measurable efficiency gain on long-running ingestion with frequent flushes. Improves semantic coherence: one flush cycle (delete-prior-symbols, upsert-file, upsert-symbols, merge-rels, upsert-tags, upsert-url-nodes) is one logical operation that should run in one session context.
+This is no longer an opportunistic session-churn cleanup. A live `dotnet-dump` capture during a reproduction of the original stall pattern (`issues/000-baseline-profiling.md`, `baseline-metrics.md`) caught the ingestion pipeline's single flush consumer thread blocked, at the exact moment of a multi-minute stall, inside:
+
+```
+Neo4jFlushService.FlushSymbols -> AsyncTransaction.CommitAsync -> DiscardUnconsumed
+  -> ResultCursorBuilder.ConsumeAsync/AdvanceAsync -> SocketConnection.ReceiveOneAsync
+  -> PipelinedMessageReader.ReadAsync  (awaiting socket read)
+```
+
+Full stack in `baseline/async-stacks.txt`. This is very plausibly the direct cause of the original Microsoft.Maui.sln ingestion stalling at 61% after 4.5 hours — not Issue 001's CPU-bound traversal theory (refuted, see baseline-metrics.md), and not primarily a session-count inefficiency.
 
 ## Problem Statement
 
-`SolutionProcessor.FlushBuffers` calls `FlushFiles`, `FlushSymbols`, `UpsertDependencyUrls` sequentially. Each opens its own `await using var session = driver.AsyncSession(...)`. `FlushSymbols` conditionally opens a **second** session for tag writes (line 128).
+`Neo4jFlushService.cs` lines 105-123, `FlushSymbols`:
 
-**Per flush cycle**: 3-4 sessions opened.
+```csharp
+await session.ExecuteWriteAsync(async tx => {
+    List<Task> tasks = [];
+    if (symbolBatch.Length > 0)
+        tasks.Add(tx.RunWithRetry(GetCypher(Queries.UpsertSymbols), new { symbols = symbolBatch }));
+    if (relBatch.Length > 0)
+        tasks.Add(tx.RunWithRetry(GetCypher(Queries.MergeRelationships), new { rels = relBatch }));
+    if (tasks.Count > 0)
+        await Task.WhenAll(tasks).ConfigureAwait(false);
+}).ConfigureAwait(false);
+```
 
-Driver pools connections internally, so cost is checkout/return overhead, not full TCP handshake — but on a long run with frequent flushes (e.g., every 500 files across 13,056 files = ~26 flush cycles), measurable and unnecessary.
+Two queries are launched **concurrently on the same transaction** (`tx`) via `Task.WhenAll`. Neither `RunWithRetry` call's result cursor is consumed by the caller — `RunAsync` returns a cursor immediately, and nothing iterates or calls `ConsumeAsync` on it before the lambda returns.
 
-**Semantic issue**: One flush cycle is conceptually one atomic unit of work (delete old symbols, upsert new files/symbols, merge relationships, upsert tags, upsert dependency URLs). Breaking it across 3-4 separate sessions obscures this logical boundary and increases connection churn.
+The Neo4j bolt protocol does not support running multiple queries concurrently against one transaction/connection — each `RunAsync` call queues a request on the same connection, and the driver must serialize the responses. When `ExecuteWriteAsync` proceeds to commit, the driver's `CommitAsync` runs an implicit `DiscardUnconsumed` step to drain any result records the caller never consumed for **both** outstanding cursors, off **one socket**, before the commit can complete. That drain is what the stack trace shows hanging.
+
+The original architect assessment (`architect.assessment.md` Finding 4) and initial issue-description.md framed this as "excess session churn" (3-4 sessions opened per flush cycle) — that observation is still true and worth fixing, but it is not the load-bearing bug. The load-bearing bug is concurrent unconsumed queries on a shared transaction.
 
 ## Acceptance Criteria
 
-1. **All writes in a flush cycle reuse one session**
-   - Add `FlushAll` method to `INeo4jFlushService` accepting all four payload types: files, symbols, relationships, urlNodes
-   - `FlushAll` opens one Neo4j session at the start, executes all writes within that session, closes at the end
-   - `SolutionProcessor.FlushBuffers` builds a `FlushPayload` record and calls `graphService.FlushAll(payload, databaseName)`
+1. **Queries within one transaction never run concurrently with unconsumed cursors.**
+   - In `FlushSymbols`, `UpsertSymbols` and `MergeRelationships` must either:
+     (a) run sequentially, each fully consumed (via `await` on the query and, if the driver requires it, consuming the summary) before the next starts, or
+     (b) run in genuinely separate transactions/sessions if concurrency is wanted.
+   - Recommended: **(a) sequential execution within the existing transaction** — simplest, matches existing atomicity boundaries, no session-count increase.
+   - Remove the `Task.WhenAll(tasks)` concurrent-dispatch pattern entirely from `FlushSymbols`.
 
-2. **Transaction batching behavior is unchanged**
-   - Existing `--batch-size` semantics preserved (still batches by configured chunk size within a flush cycle)
-   - Each write operation (files, symbols, rels, tags, URLs) runs in its own transaction **within the same session** (not across separate sessions)
-   - Transactional boundaries remain the same (e.g., files + symbols are not merged into one transaction unless that was already the case)
+2. **Repro no longer stalls.**
+   - Re-run the exact repro from `baseline-metrics.md` (single-project ingestion against `Controls.Core.csproj`, or the full `Microsoft.Maui.sln` run) with the fix applied.
+   - Verify: no multi-minute `%CPU`-idle stall reproduces at the same file-count checkpoint (or any checkpoint), using the same sampling approach (`samples.txt`-style CPU/RSS polling) as a regression check.
 
-3. **Session lifecycle is predictable**
-   - Session opened once at `FlushAll` entry
-   - Session closed once at `FlushAll` exit (via `await using`)
-   - On partial flush failure (e.g., files succeed, symbols throw), session is disposed cleanly (no leaked connections)
+3. **All Neo4j write result cursors across the codebase are checked for the same anti-pattern.**
+   - Audit `FlushFiles`, `UpsertDependencyUrls`, and any other `Neo4jFlushService`/`Neo4jSchemaService` method that calls `RunWithRetry` more than once inside a single `ExecuteWriteAsync`/`ExecuteReadAsync` delegate — confirm none of them share the same concurrent-unconsumed-cursor pattern. Fix any found.
 
-4. **Existing methods remain on the interface**
-   - `INeo4jFlushService.FlushFiles`, `FlushSymbols`, `UpsertDependencyUrls` are **not removed** (backward-compatible)
-   - Independent callers (e.g., dependency ingestor, future incremental-update flows) can still call individual methods
-   - `FlushAll` is an additive convenience method, not a replacement
+4. **Session count per flush cycle is also reduced (secondary, from original Issue 004 scope).**
+   - `FlushFiles`, `FlushSymbols` (+ optional tag session), `UpsertDependencyUrls` currently open 3-4 separate sessions per flush cycle.
+   - Once (1) is fixed and proven safe, consolidate to one session per flush cycle via a `FlushAll(FlushPayload, databaseName)` method on `INeo4jFlushService`, as originally scoped. This is now secondary — do not let it block or complicate the primary correctness fix in (1).
+   - Existing individual methods (`FlushFiles`, `FlushSymbols`, `UpsertDependencyUrls`) remain on the interface, not removed.
 
-5. **API surface is backward-compatible**
-   - `INeo4jFlushService` gains `FlushAll(FlushPayload payload, string databaseName) : Task`
-   - New `FlushPayload` record: `{ IReadOnlyList<FileNode> Files, IReadOnlyList<SymbolNode> Symbols, IReadOnlyList<Relationship> Relationships, IReadOnlyList<DependencyUrlNode> UrlNodes }`
-   - `SolutionProcessor.FlushBuffers` is updated to call `FlushAll` instead of individual methods
-   - Existing callers of individual methods are unaffected
-
-6. **Session churn is measurably reduced**
-   - Neo4j driver metrics (or connection count logs) show **60%+ reduction** in session open count on a long ingestion run (e.g., MAUI 13,056 files = ~26 flush cycles → 26 sessions opened instead of 78-104)
-   - Baseline: 3-4 sessions per flush cycle. Target: 1 session per flush cycle.
+5. **Regression test added.**
+   - Integration test: call `FlushSymbols` with a symbol batch and a relationship batch both large enough to require multiple bolt protocol chunks (not just 1-2 rows — this bug may only manifest with nontrivial result/record volume). Assert it completes within a bounded time (e.g. a few seconds) rather than hanging.
+   - Unit test: with a fake/mocked `IAsyncQueryRunner`, assert queries are invoked sequentially (second `RunWithRetry` call happens after the first's task has been awaited), not both fired before either is awaited.
 
 ## Test Plan
 
-- **Unit test**: Mock `IDriver` and `IAsyncSession`. Call `FlushAll` with non-empty payloads for all four types. Verify `AsyncSession()` is called **once**, all four write operations execute within that session, session is disposed.
-- **Integration test**: Run ingestion on a solution with 1,000 files (triggering 2-3 flush cycles). Instrument Neo4j driver to count session opens. Verify session count = flush cycle count (not 3x or 4x).
-- **Partial failure test**: Mock `FlushSymbols` to throw after `FlushFiles` succeeds. Verify session is disposed cleanly, no leaked connections in driver pool.
-- **Backward-compatibility test**: Call `INeo4jFlushService.FlushFiles()` directly (not via `FlushAll`). Verify it still opens its own session and executes successfully (existing callers unaffected).
+- **Repro regression test** (AC #2): automate the exact baseline repro (or a smaller version) as a CI-runnable integration test if feasible — ingest a project with 500+ files against a real or containerized Neo4j instance, assert completion within a bounded wall-clock budget.
+- **Unit test** (AC #5): mock transaction/query runner, assert sequential invocation order for `FlushSymbols`'s two queries.
+- **Audit test coverage** (AC #3): for each other flush method found to use the concurrent-unconsumed pattern, add the same sequential-invocation-order unit test.
+- **Session count test** (AC #4, secondary): as originally scoped — mock `IDriver`, assert `AsyncSession()` called once per flush cycle after consolidation.
 
 ## Architecture Reference
 
-See `architect.assessment.md` **Finding 4 — Excess Neo4j Session Churn Per Flush Cycle (Lower Priority)**, lines 145-189.
-
-Proposed design:
-- Add `FlushAll` to `INeo4jFlushService` accepting `FlushPayload` record (files, symbols, rels, urlNodes)
-- `FlushAll` opens one session, runs all writes within a single `ExecuteWriteAsync` transaction scope (or sequentially within the session, per atomicity needs), closes
-- Existing three methods remain on the interface for independent callers (not removed)
-- `SolutionProcessor.FlushBuffers` builds `FlushPayload` and calls `graphService.FlushAll(payload, databaseName)`
-
-Alternative considered: pass `IAsyncSession` into each method — rejected, inverts session-lifetime ownership onto callers and leaks infrastructure concerns across the interface boundary.
+Original: `architect.assessment.md` Finding 4 — "Excess Neo4j Session Churn Per Flush Cycle," lines 145-189. That analysis remains valid as a secondary cleanup (AC #4) but is superseded in priority by the correctness bug documented here, found via `baseline/async-stacks.txt`.
 
 ## Dependencies
 
-- None. Self-contained change within `Neo4jFlushService` and `SolutionProcessor.FlushBuffers`.
+- None for the primary fix (AC #1-3) — self-contained to `Neo4jFlushService.FlushSymbols` and an audit of sibling methods.
+- AC #4 (session consolidation) depends on AC #1 being proven safe first — do not consolidate sessions before fixing the concurrent-cursor bug, or the same deadlock could resurface with one fewer session to blame it on.
 
 ## Effort Estimate
 
-**Low-Medium** — Additive interface change + new `FlushPayload` record + updated `FlushBuffers` implementation. No structural refactor. ~50 lines of new code, ~10 lines modified in `FlushBuffers`.
+**Low** for the primary fix (AC #1-3) — remove `Task.WhenAll`, run queries sequentially. Likely under 20 lines changed in `FlushSymbols`, plus an audit pass over other flush methods.
+**Low-Medium** for AC #4 (session consolidation), as originally scoped — unchanged from prior estimate.
 
 ## Out of Scope
 
-- Neo4j Cypher statement optimization (query performance is adequate; session churn is the issue here, not query cost)
-- Batching strategy changes (e.g., merging files + symbols into a single transaction instead of separate transactions within the same session). Current transactional boundaries are preserved.
-- Driver connection pool tuning (e.g., max pool size, idle timeout). Session reuse reduces churn but does not change pool configuration.
+- Neo4j Cypher statement optimization (query performance is adequate once queries aren't deadlocking each other).
+- Driver connection pool tuning (max pool size, idle timeout) — unrelated to this bug.
+- Batching strategy changes beyond removing the concurrent dispatch (e.g., merging files + symbols into a single transaction) — not part of this fix.
 
 ## Risks
 
-- **Partial flush failure + rolled-back state**: If `FlushFiles` succeeds but `FlushSymbols` throws, files are already committed (separate transaction). Session disposal does not roll back committed transactions. This is **existing behavior** — not a new risk introduced by session reuse. Document that `FlushAll` preserves current transactional boundaries (each write is atomic, but the full cycle is not one transaction).
-- **Transaction scope ambiguity**: Architect doc says "within a single `ExecuteWriteAsync` transaction scope (or sequentially within the session, per atomicity needs)." Which one? **RECOMMEND**: Sequential transactions within the same session (preserve current atomicity boundaries). Merging into one transaction is a separate change with different failure semantics.
+- **Sequentializing may increase flush latency slightly** (two round trips instead of a theoretically-concurrent two) — acceptable tradeoff for correctness; the "concurrent" version was never actually concurrent in practice given the protocol constraint, it was just silently broken.
+- **Other undiscovered instances of the same pattern** elsewhere in the codebase (AC #3's audit) — if missed, the same class of stall could resurface in a different flush path.
 
 ## Rollback Plan
 
-If session reuse introduces transactional correctness issues (e.g., unintended cross-write isolation):
-1. Revert `SolutionProcessor.FlushBuffers` to call individual `FlushFiles`, `FlushSymbols`, `UpsertDependencyUrls` methods
-2. Remove `FlushAll` method from `INeo4jFlushService` (or mark as obsolete)
-3. Re-run integration tests to confirm flush behavior matches baseline
-4. Root-cause the transaction-scope issue (e.g., unintended read-your-writes visibility) before re-attempting
+If sequential execution introduces unexpected latency regressions:
+1. Revert to `Task.WhenAll`, but split `UpsertSymbols` and `MergeRelationships` into **separate transactions on separate sessions** instead of one shared transaction — this restores concurrency without violating the single-transaction constraint.
+2. Re-run the repro regression test to confirm the stall does not reappear under this alternative.
 
 ## Success Metrics
 
-- **Primary**: Neo4j session open count reduced by 60%+ on a long ingestion run (e.g., MAUI 26 flush cycles → 26 sessions instead of 78-104)
-- **Secondary**: No observable change to graph output (files, symbols, relationships, tags, dependency URLs identical to baseline)
-- **Verification**: Partial flush failure test passes (session disposed cleanly, no leaked connections)
+- **Primary**: repro from `baseline-metrics.md` completes without a multi-minute idle stall at the same checkpoint (or any checkpoint) previously observed.
+- **Secondary**: Microsoft.Maui.sln full ingestion completes in well under the original 4.5+ hours (exact target TBD pending a full-solution re-run with the fix, since the original "90 minute" target in `issue-description.md` was set before this root cause was known).
+- **Tertiary** (AC #4): session open count reduced once consolidated, as originally scoped.
 
-## Gaps Flagged During Grooming
+## Gaps Flagged During Grooming (carried over, still relevant to AC #4)
 
-1. **Transaction scope ambiguity**: Architect doc does not specify whether `FlushAll` should wrap all writes in **one transaction** or keep them as **separate transactions within the same session**. Original issue-description.md says "Transaction batching behavior remains unchanged (still batches by `--batch-size` equivalent)" → implies separate transactions (preserve current boundaries). But architect doc says "single `ExecuteWriteAsync` transaction scope (or sequentially within the session, per atomicity needs)" → two options, no clear choice. **RECOMMEND**: Clarify before implementation. Likely answer: sequential transactions (safer, preserves current semantics).
-2. **No acceptance criterion for "partial flush failures gracefully"**: Original issue-description.md constraint says "Must handle partial flush failures gracefully (e.g., files succeed, symbols fail — session cleanup)." This is stated as a constraint but not tested in the acceptance criteria. Added as AC #3 and to the test plan (partial failure test).
-3. **No guidance on driver metrics collection**: AC #6 says "measured via driver metrics or connection count logs" — but how? Neo4j .NET driver does not expose session-open-count metrics out of the box. **RECOMMEND**: Add instrumentation wrapper around `IDriver.AsyncSession()` that logs or increments a counter on each call. Verify in integration test via this counter, not external driver metrics (which may not exist).
-4. **Unclear whether `FlushPayload` should be immutable**: Architect diagram shows `FlushPayload` as a record (immutable by default in C#). Confirm: should it be a `record` (immutable) or a `class` (mutable)? **RECOMMEND**: `record` (immutable) — flush payload is a snapshot of buffered data at a point in time, should not be mutated after construction.
+1. Whether `FlushPayload` should be a `record` (immutable) — yes, recommended, unchanged from prior grooming.
+2. Driver metrics for session-count verification still need a manual counter wrapper around `IDriver.AsyncSession()` — Neo4j .NET driver doesn't expose this natively.
+3. **New gap**: no existing test in the codebase exercises `FlushSymbols` with a batch large enough to trigger multi-chunk bolt protocol responses — this is likely why the bug shipped unnoticed. Any regression test added here should specifically target that condition, not just assert a small unit-test-sized batch succeeds.

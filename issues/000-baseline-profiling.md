@@ -2,7 +2,7 @@
 
 **Priority:** P0 — BLOCKING (gates Issues 001 and 004)
 **Effort:** Low
-**Status:** RUN — see `baseline-metrics.md`. Verdict: Issue 001's CPU-bound quadratic-traversal theory is **refuted** by observed behavior (0% CPU during multi-minute stalls, bursty not sloped progress, zero active thread-pool workers during a stall). Leading new hypothesis: I/O-bound stall, likely Neo4j-side, blocking the flush consumer and backpressuring the whole pipeline via the bounded channel. Issue 001 must be re-scoped before implementation; Issue 004 gains new relevance. Issues 002/003 unaffected, proceed as planned.
+**Status:** RUN — see `baseline-metrics.md` and `baseline/async-stacks.txt`. Verdict: Issue 001's CPU-bound quadratic-traversal theory is **refuted**. A live `dotnet-dump` capture during a repro stall pinpoints the exact wait: `Neo4jFlushService.FlushSymbols` runs two Cypher queries concurrently on one transaction via `Task.WhenAll`, neither cursor consumed — `CommitAsync`'s implicit `DiscardUnconsumed` step hangs draining both off one socket. This is a correctness bug in `Neo4jFlushService.cs` lines 105-123, not a CPU or session-count problem. Issue 001 de-prioritized pending re-justification; Issue 004 rewritten around this exact bug. Issues 002/003 unaffected, proceed as planned.
 
 ## Problem
 

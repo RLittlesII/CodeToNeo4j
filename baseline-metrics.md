@@ -47,12 +47,40 @@ Checked `Neo4j/Neo4jExtensions.cs` retry policy: base delay is 10ms exponential 
 
 Git subprocess spawning (Issue 003's suspect) and MSBuild re-evaluation of broken projects (Issue 002's suspect) are both **ruled out** as causes of this specific stall pattern based on direct observation (no child processes spawned during the stalls).
 
+## Exact Wait Point — Confirmed via Live Memory Dump
+
+The `dotnet-trace` capture above only carried informational CLR events (no CPU-sampling provider was enabled), so it could not show a managed callstack for a genuinely async, non-spinning wait. To get the exact blocked line, a second repro was run and, on hitting the same stall pattern (dead at 27/2792, `%CPU` 0.0), a full memory dump was taken with `dotnet-dump collect --process-id <pid>` and analyzed with `dotnet-dump analyze` + SOS's `dumpasync --coalesce --fields` (async-aware; walks GC-heap Task/state-machine objects and their continuations regardless of whether a thread is currently running them — full stacks in `async-stacks.txt`).
+
+**Confirmed exact wait point** (STACKS 5 in `async-stacks.txt`):
+
+```
+SolutionProcessor.RunConsumer -> FlushBuffers -> Neo4jFlushService.FlushSymbols
+  -> AsyncSession.RunTransactionAsync -> AsyncTransaction.CommitAsync -> DiscardUnconsumed
+  -> ResultCursorBuilder.ConsumeAsync/AdvanceAsync -> SocketConnection.ReceiveOneAsync
+  -> PipelinedMessageReader.ReadAsync/ReadNextMessage  (awaiting socket read)
+```
+
+The single flush consumer is blocked inside the Neo4j driver's implicit **`DiscardUnconsumed`** step during `CommitAsync`, waiting on a bolt-protocol socket read that isn't completing. STACKS 3 confirms the producer side is exactly where expected — `ChannelReader.ReadAllAsync`, i.e. genuinely backpressured waiting for this one consumer to drain, matching the burst-then-freeze pattern precisely.
+
+**Root cause identified in source** — `Neo4jFlushService.cs` lines 105-123, `FlushSymbols`:
+
+```csharp
+await session.ExecuteWriteAsync(async tx => {
+    tasks.Add(tx.RunWithRetry(GetCypher(Queries.UpsertSymbols), new { symbols = symbolBatch }));
+    tasks.Add(tx.RunWithRetry(GetCypher(Queries.MergeRelationships), new { rels = relBatch }));
+    await Task.WhenAll(tasks).ConfigureAwait(false);
+});
+```
+
+Both queries are launched **concurrently on the same transaction (`tx`)** via `Task.WhenAll`, and neither result cursor is consumed by the caller (`RunWithRetry` just calls `RunAsync`, which returns a cursor immediately — nothing calls `ConsumeAsync`/iterates the records). The Neo4j bolt protocol does not support running multiple queries concurrently against one transaction/connection — this is a documented anti-pattern in the driver. The two unconsumed result streams sit on the wire until `CommitAsync` runs its implicit `DiscardUnconsumed`, which then has to drain both off a single socket before the commit can complete. That drain is what's hanging.
+
+This is a **correctness bug**, not a resource-churn inefficiency — it changes Issue 004 from "reduce session count" to "stop running concurrent unconsumed queries on a shared transaction." It is also the most direct, evidence-backed explanation available for the original multi-hour production stall, and should be treated as the new P0 fix ahead of Issue 001.
+
 ## Recommendation
 
-1. **Re-open/re-scope Issue 001** — do not implement the global-using cache fix as currently scoped until the actual CPU-bound cost is confirmed with a proper managed stack trace (e.g. `dotnet-trace` analyzed with PerfView/speedscope, or `dotnet-dump` on a live hang) showing time actually spent inside `RoslynSymbolProcessor`.
-2. **New priority-0 investigation**: trace what the single Neo4j-flush consumer thread is awaiting during a stall — instrument `Neo4jFlushService` and the channel consumer loop in `SolutionProcessor.RunConsumer` with a stopwatch/logging around each `await`, or attach a debugger during a live stall and get a real managed callstack (`dotnet-dump collect` + `dotnet-dump analyze`, or a Visual Studio/Rider remote attach) to identify the exact blocked line.
+1. **Re-open/re-scope Issue 001** — the global-using cache fix may still be worth doing, but it is not implicated by this evidence. Do not treat it as P0 until proven independently (e.g. once the Issue 004 fix below lands, re-run this same repro and see if a *new*, CPU-bound stall pattern emerges).
+2. **Promote to new P0**: fix `Neo4jFlushService.FlushSymbols` to not run concurrent queries on one transaction with unconsumed cursors. Options: run the two queries sequentially within the transaction (simplest, safest), or consume each cursor's summary (`await result.ConsumeAsync()`) before considering it done, or use separate transactions per query if true concurrency is wanted. This supersedes Issue 004's original "reduce session churn" framing — rewrite Issue 004 around this specific bug.
 3. Issues 002 and 003 remain valid, independently-justified correctness/efficiency fixes regardless of this finding — proceed with those as already gated in `BACKLOG.md`.
-4. Issue 004 (Neo4j session churn) gains new relevance in light of this finding — if the stall is Neo4j-side, session/connection handling is now the top suspect, not just an opportunistic cleanup.
 
 ## Artifacts
 
@@ -61,3 +89,4 @@ Git subprocess spawning (Issue 003's suspect) and MSBuild re-evaluation of broke
 - `stackSample.txt` — native thread listing during an active stall, showing zero active thread-pool workers.
 - `direct-run.txt` — full tool console output for this run.
 - `launch-mode-failure.txt`, `attach.txt` — dotnet-trace launch-mode failure logs (kept for reference; launch mode did not work, attach mode did).
+- `async-stacks.txt` — `dumpasync --coalesce --fields` output from a live `dotnet-dump` capture during a second repro's stall — the exact wait point (see section above). The 6.5GB raw `.dmp` file was deleted after analysis, not kept.
