@@ -91,7 +91,12 @@ public class SolutionProcessor(
 				}
 			}
 
-			ParallelOptions parallelOptions = new() { MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount) };
+			using CancellationTokenSource consumerFaultCts = new();
+			ParallelOptions parallelOptions = new()
+			{
+				MaxDegreeOfParallelism = Math.Max(2, Environment.ProcessorCount),
+				CancellationToken = consumerFaultCts.Token
+			};
 
 			var discoveredFiles = discoveryService.GetFilesToProcess(solutionRoot, solution, extensionsToInclude);
 			var filesToProcess = FilterFiles(discoveredFiles, diffResult?.ModifiedFiles);
@@ -116,11 +121,26 @@ public class SolutionProcessor(
 
 			var consumerTask = RunConsumer(channel.Reader, totalFiles, databaseName, batchSize);
 
-			await Parallel.ForEachAsync(filesToProcess, parallelOptions, async (file, t) =>
+			// If the consumer faults (e.g. Neo4j becomes unreachable), cancel the producers so they
+			// don't deadlock forever writing to a channel nobody is draining anymore.
+			_ = consumerTask.ContinueWith(
+				_ => consumerFaultCts.Cancel(),
+				CancellationToken.None,
+				TaskContinuationOptions.OnlyOnFaulted,
+				TaskScheduler.Default);
+
+			try
 			{
-				var result = await ProcessFile(solution, file, solutionRoot, repoKey, minAccessibility).ConfigureAwait(false);
-				await channel.Writer.WriteAsync(result, t).ConfigureAwait(false);
-			}).ConfigureAwait(false);
+				await Parallel.ForEachAsync(filesToProcess, parallelOptions, async (file, t) =>
+				{
+					var result = await ProcessFile(solution, file, solutionRoot, repoKey, minAccessibility).ConfigureAwait(false);
+					await channel.Writer.WriteAsync(result, t).ConfigureAwait(false);
+				}).ConfigureAwait(false);
+			}
+			catch (OperationCanceledException) when (consumerFaultCts.IsCancellationRequested)
+			{
+				// Real failure surfaces below when consumerTask is awaited.
+			}
 
 			channel.Writer.Complete();
 			var (totalSymbols, totalRelationships) = await consumerTask.ConfigureAwait(false);
