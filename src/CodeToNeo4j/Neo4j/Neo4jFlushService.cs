@@ -64,16 +64,24 @@ public class Neo4jFlushService(
 		var fileKeys = fileBatch.Select(f => f["fileKey"]).ToArray();
 
 		await using var session = driver.AsyncSession(o => o.WithDatabase(databaseName));
+
 		await session.ExecuteWriteAsync(async tx =>
 		{
 			await tx.RunWithRetry(cypherService.GetCypher(Queries.DeletePriorSymbols), new { fileKeys }).ConfigureAwait(false);
+		}).ConfigureAwait(false);
 
-			foreach (var chunk in Chunk(fileBatch, MaxRowsPerQuery))
+		// Each chunk commits as its own transaction so Neo4j releases that transaction's memory
+		// before the next chunk starts -- chunking rows within one transaction (as before) doesn't
+		// bound peak transaction memory, since Neo4j tracks write/undo state for the whole
+		// transaction until commit, not per-statement.
+		foreach (var chunk in Chunk(fileBatch, MaxRowsPerQuery))
+		{
+			await session.ExecuteWriteAsync(async tx =>
 			{
 				var filesCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertFile), new { files = chunk }).ConfigureAwait(false);
 				await filesCursor.ConsumeAsync().ConfigureAwait(false);
-			}
-		}).ConfigureAwait(false);
+			}).ConfigureAwait(false);
+		}
 	}
 
 	public async Task FlushSymbols(IEnumerable<Symbol> symbols, IEnumerable<Relationship> relationships, string databaseName)
@@ -121,33 +129,37 @@ public class Neo4jFlushService(
 			relBatch.Length, databaseName);
 
 		await using var session = driver.AsyncSession(o => o.WithDatabase(databaseName));
-		await session.ExecuteWriteAsync(async tx =>
+
+		foreach (var chunk in Chunk(symbolBatch, MaxRowsPerQuery))
 		{
-			foreach (var chunk in Chunk(symbolBatch, MaxRowsPerQuery))
+			await session.ExecuteWriteAsync(async tx =>
 			{
 				var symbolsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertSymbols), new { symbols = chunk }).ConfigureAwait(false);
 				await symbolsCursor.ConsumeAsync().ConfigureAwait(false);
-			}
+			}).ConfigureAwait(false);
+		}
 
-			foreach (var chunk in Chunk(relBatch, MaxRowsPerQuery))
+		foreach (var chunk in Chunk(relBatch, MaxRowsPerQuery))
+		{
+			await session.ExecuteWriteAsync(async tx =>
 			{
 				var relsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.MergeRelationships), new { rels = chunk }).ConfigureAwait(false);
 				await relsCursor.ConsumeAsync().ConfigureAwait(false);
-			}
-		}).ConfigureAwait(false);
+			}).ConfigureAwait(false);
+		}
 
 		if (tagBatch.Length > 0)
 		{
 			logger.LogDebug("Upserting namespace tags for {Count} symbols (Database: {DatabaseName})...", tagBatch.Length, databaseName);
 			await using var tagSession = driver.AsyncSession(o => o.WithDatabase(databaseName));
-			await tagSession.ExecuteWriteAsync(async tx =>
+			foreach (var chunk in Chunk(tagBatch, MaxRowsPerQuery))
 			{
-				foreach (var chunk in Chunk(tagBatch, MaxRowsPerQuery))
+				await tagSession.ExecuteWriteAsync(async tx =>
 				{
 					var tagsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertTags), new { symbolTags = chunk }).ConfigureAwait(false);
 					await tagsCursor.ConsumeAsync().ConfigureAwait(false);
-				}
-			}).ConfigureAwait(false);
+				}).ConfigureAwait(false);
+			}
 		}
 	}
 
@@ -163,13 +175,13 @@ public class Neo4jFlushService(
 
 		logger.LogDebug("Upserting {Count} dependency URL nodes in database: {DatabaseName}", urlBatch.Length, databaseName);
 		await using var session = driver.AsyncSession(o => o.WithDatabase(databaseName));
-		await session.ExecuteWriteAsync(async tx =>
+		foreach (var chunk in Chunk(urlBatch, MaxRowsPerQuery))
+		{
+			await session.ExecuteWriteAsync(async tx =>
 			{
-				foreach (var chunk in Chunk(urlBatch, MaxRowsPerQuery))
-				{
-					var cursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertDependencyUrls), new { urls = chunk });
-					await cursor.ConsumeAsync();
-				}
+				var cursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertDependencyUrls), new { urls = chunk });
+				await cursor.ConsumeAsync();
 			}).ConfigureAwait(false);
+		}
 	}
 }
