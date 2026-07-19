@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO.Abstractions;
@@ -202,7 +203,7 @@ public class TypeScriptBridgeService(IFileSystem fileSystem, ILogger<TypeScriptB
 		}
 	}
 
-	private readonly Dictionary<string, TsAnalysisResult?> _cache = new(StringComparer.OrdinalIgnoreCase);
+	private readonly ConcurrentDictionary<string, TsAnalysisResult?> _cache = new(StringComparer.OrdinalIgnoreCase);
 	private string? _bridgeDir;
 
 	private static readonly TimeSpan _defaultTimeout = TimeSpan.FromMinutes(5);
