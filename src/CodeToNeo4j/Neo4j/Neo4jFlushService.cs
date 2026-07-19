@@ -15,6 +15,20 @@ public class Neo4jFlushService(
 {
 	internal const int MaxIndexedStringLength = 8000;
 
+	// Caps the row count of any single Cypher UNWIND, independent of the caller's --batch-size.
+	// A single file can produce a burst of symbols/relationships far larger than --batch-size
+	// (e.g. a generated file with thousands of cross-references); without this cap that one
+	// file's flush becomes a single oversized transaction regardless of upstream buffering.
+	internal const int MaxRowsPerQuery = 250;
+
+	private static IEnumerable<Dictionary<string, object?>[]> Chunk(Dictionary<string, object?>[] source, int chunkSize)
+	{
+		for (var i = 0; i < source.Length; i += chunkSize)
+		{
+			yield return source[i..Math.Min(i + chunkSize, source.Length)];
+		}
+	}
+
 	public async Task FlushFiles(IEnumerable<FileMetaData> files, string databaseName)
 	{
 		var fileBatch = files.Select(file => new Dictionary<string, object?>
@@ -53,7 +67,12 @@ public class Neo4jFlushService(
 		await session.ExecuteWriteAsync(async tx =>
 		{
 			await tx.RunWithRetry(cypherService.GetCypher(Queries.DeletePriorSymbols), new { fileKeys }).ConfigureAwait(false);
-			await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertFile), new { files = fileBatch }).ConfigureAwait(false);
+
+			foreach (var chunk in Chunk(fileBatch, MaxRowsPerQuery))
+			{
+				var filesCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertFile), new { files = chunk }).ConfigureAwait(false);
+				await filesCursor.ConsumeAsync().ConfigureAwait(false);
+			}
 		}).ConfigureAwait(false);
 	}
 
@@ -104,15 +123,15 @@ public class Neo4jFlushService(
 		await using var session = driver.AsyncSession(o => o.WithDatabase(databaseName));
 		await session.ExecuteWriteAsync(async tx =>
 		{
-			if (symbolBatch.Length > 0)
+			foreach (var chunk in Chunk(symbolBatch, MaxRowsPerQuery))
 			{
-				var symbolsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertSymbols), new { symbols = symbolBatch }).ConfigureAwait(false);
+				var symbolsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertSymbols), new { symbols = chunk }).ConfigureAwait(false);
 				await symbolsCursor.ConsumeAsync().ConfigureAwait(false);
 			}
 
-			if (relBatch.Length > 0)
+			foreach (var chunk in Chunk(relBatch, MaxRowsPerQuery))
 			{
-				var relsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.MergeRelationships), new { rels = relBatch }).ConfigureAwait(false);
+				var relsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.MergeRelationships), new { rels = chunk }).ConfigureAwait(false);
 				await relsCursor.ConsumeAsync().ConfigureAwait(false);
 			}
 		}).ConfigureAwait(false);
@@ -123,7 +142,11 @@ public class Neo4jFlushService(
 			await using var tagSession = driver.AsyncSession(o => o.WithDatabase(databaseName));
 			await tagSession.ExecuteWriteAsync(async tx =>
 			{
-				await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertTags), new { symbolTags = tagBatch }).ConfigureAwait(false);
+				foreach (var chunk in Chunk(tagBatch, MaxRowsPerQuery))
+				{
+					var tagsCursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertTags), new { symbolTags = chunk }).ConfigureAwait(false);
+					await tagsCursor.ConsumeAsync().ConfigureAwait(false);
+				}
 			}).ConfigureAwait(false);
 		}
 	}
@@ -142,8 +165,11 @@ public class Neo4jFlushService(
 		await using var session = driver.AsyncSession(o => o.WithDatabase(databaseName));
 		await session.ExecuteWriteAsync(async tx =>
 			{
-				var cursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertDependencyUrls), new { urls = urlBatch });
-				await cursor.ConsumeAsync();
+				foreach (var chunk in Chunk(urlBatch, MaxRowsPerQuery))
+				{
+					var cursor = await tx.RunWithRetry(cypherService.GetCypher(Queries.UpsertDependencyUrls), new { urls = chunk });
+					await cursor.ConsumeAsync();
+				}
 			}).ConfigureAwait(false);
 	}
 }
