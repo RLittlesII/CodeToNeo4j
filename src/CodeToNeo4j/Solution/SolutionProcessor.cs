@@ -195,7 +195,7 @@ public class SolutionProcessor(
 			totalSymbols += result.Symbols.Count;
 			totalRelationships += result.Relationships.Count;
 
-			if (fileBuffer.Count >= batchSize || symbolBuffer.Count >= batchSize)
+			if (fileBuffer.Count >= batchSize || symbolBuffer.Count >= batchSize || relBuffer.Count >= batchSize || urlBuffer.Count >= batchSize)
 			{
 				await FlushBuffers(fileBuffer, symbolBuffer, relBuffer, urlBuffer, databaseName).ConfigureAwait(false);
 			}
