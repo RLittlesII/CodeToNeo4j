@@ -1,5 +1,7 @@
 # Performance Remediation Backlog
 
+**RESOLVED.** Full Microsoft.Maui.sln ingestion (13,056 files) now completes in **26m 19s**, 100% clean, zero crashes. Original problem: 4.5 hours, dead at 61%, forever. Final confirmed run: 5,638,107 symbol nodes, 5,867,433 relationships created, no purge beforehand (ran on top of the night's accumulated test data, still completed cleanly). See "Session Outcome" section near the bottom for the full list of root causes found and fixed — real bugs went well beyond the original four issues below, which were the *starting* hypothesis, not the final list.
+
 This backlog addresses four confirmed performance root causes from the Microsoft.Maui.sln ingestion run (13,056 files, stalled at 61% after 4.5 hours). Each issue is scoped, prioritized, and mapped to the architect's remediation design in `architect.assessment.md`.
 
 **Issue 000 has been RUN.** A live memory dump during a reproduction pinpointed the exact wait point: `Neo4jFlushService.FlushSymbols` runs two Cypher queries concurrently on one transaction with unconsumed result cursors, and the driver's implicit `DiscardUnconsumed` step during commit hangs draining them. This is a correctness bug, not Issue 001's claimed CPU-bound AST traversal (refuted) or a session-count inefficiency. See `baseline-metrics.md` and `baseline/async-stacks.txt` for the full evidence chain. Priorities below reflect this finding — Issue 004 was rewritten and promoted to P0; Issue 001 was demoted pending re-justification.
@@ -71,6 +73,23 @@ See "Gaps Flagged During Grooming" section at the end of each issue document:
 - **Issue 003**: Requirements mention "OR: eliminate cache miss path entirely" but architect design preserves miss path (gap vs. requirements), no test for concurrent read/write safety, no guidance on `GetOrAdd` follow-up optimization
 - **Issue 004**: Rewritten around confirmed root cause (concurrent unconsumed queries on one transaction, `Neo4jFlushService.FlushSymbols`). Original session-churn scope retained as secondary AC #4. New gap: no existing test exercises `FlushSymbols` with a batch large enough to trigger multi-chunk bolt protocol responses — likely why the bug shipped unnoticed; regression test must target that condition specifically.
 - **Issue 001**: Demoted — not implicated by profiling evidence (CPU was idle during the observed stalls, not pegged). Re-justify with fresh profiling after Issue 004 lands before implementing.
+
+## Session Outcome
+
+**Confirmed final result**: Full `Microsoft.Maui.sln` ingestion (13,056 files) completes in **26m 19s**, 100% clean. 5,638,107 symbol nodes and 5,867,433 relationships created (counted by `SolutionProcessor`'s own internal counter, independent of Neo4j — not inflated by duplicates; `MERGE`-by-key is deterministic and constraint-enforced, verified). Original problem: 4.5 hours, dead at 61%, forever, unattended.
+
+Real root causes found and fixed this session, discovered by repeatedly re-running the full solution and following each new failure to its actual cause (not by theorizing):
+
+1. `f4c7cde` — **Neo4j concurrent-unconsumed-query deadlock.** `Neo4jFlushService.FlushSymbols` ran two Cypher queries concurrently on one transaction with unconsumed result cursors; the driver's implicit `DiscardUnconsumed` at commit hung forever. Found via live `dotnet-dump` capture during a repro.
+2. `37fc203` — **`GitMetadataCache` race.** Plain `Dictionary` written concurrently from the parallel file-processing loop; crashed with a real "non-concurrent collection corrupted" exception under load. Swapped to `ConcurrentDictionary`.
+3. `cf08f8a` — **Same race in `TypeScriptBridgeService`/`DartBridgeService`** analysis-result caches. Same fix.
+4. `9a0d75f` — **TS/Dart bridge single-flight dedup + non-blocking wait.** Cache-then-spawn race meant N files sharing one project root each spawned their own subprocess; `process.WaitForExit(int)` blocked the thread pool synchronously for up to 5 minutes, starving the rest of the async pipeline. Fixed with `ConcurrentDictionary<string, Lazy<Task<T>>>` + `GetOrAdd`, and `WaitForExitAsync` + cancellation token.
+5. `b31cfce` — **Producer/consumer deadlock on infra failure.** If Neo4j went unreachable mid-run, the flush consumer faulted silently and nothing told the parallel producers to stop — they deadlocked forever writing to a channel nobody was draining. Fixed by cancelling producers on consumer fault.
+6. `81a20d6` — **Flush-trigger batching gap.** `RunConsumer`'s flush trigger checked `fileBuffer`/`symbolBuffer` against `--batch-size` but never `relBuffer`/`urlBuffer`, letting a single file's relationship burst produce a far-larger-than-configured transaction.
+7. `68a277a` — **Per-query row cap.** Capped every Cypher `UNWIND` at a hard 250-row ceiling, independent of `--batch-size`, so no single file's burst can produce an oversized query — though this alone didn't fix the memory wall (see next).
+8. `b5c2b8a` — **Per-chunk transactions + bounded tsconfig discovery.** The row-cap fix (#7) still ran all chunks inside one shared transaction — Neo4j tracks write/undo state for the whole transaction until commit, not per-statement, so peak transaction memory was unchanged (confirmed by watching container memory stay flat via `docker stats` while the identical crash still occurred — real evidence gathered before touching memory settings). Fixed by giving each chunk its own transaction. Also fixed, in the same commit: `tools/ts-analyzer/src/analyzer.ts`'s `ts.findConfigFile` walked arbitrarily far up the directory tree past the project root looking for `tsconfig.json`, found a distant ancestor, and parsed every file that ancestor's config included before an output-time filter discarded the irrelevant results — the actual cause of the recurring macOS folder-permission prompts. Confirmed pre-existing, not a regression from this session's other TS bridge changes.
+
+Neo4j's own memory/heap settings were bumped once early on (3G heap / 2G transaction max / APOC installed) for unrelated reasons (missing plugin, initial capacity) — the user explicitly declined bumping further and required every code-side option be exhausted first, which led directly to finding bugs #7 and #8. The final clean run completed within the existing 2G transaction cap, no further memory increase needed.
 
 ## Related Documents
 
