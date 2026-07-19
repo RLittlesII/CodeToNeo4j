@@ -9,7 +9,7 @@ This backlog addresses four confirmed performance root causes from the Microsoft
 | Issue | Title | Priority | Effort | Impact |
 |-------|-------|----------|--------|--------|
 | [000](issues/000-baseline-profiling.md) | Baseline Profiling Before Remediation (LOCAL ONLY) | P0 — DONE | Low | Identified the actual root cause — see verdict above |
-| [004](issues/004-neo4j-session-reuse.md) | Fix Concurrent-Unconsumed-Query Deadlock in Neo4j Flush | **P0 — CRITICAL** (promoted) | Low | Confirmed cause of the observed multi-minute stalls — see `baseline/async-stacks.txt` |
+| [004](issues/004-neo4j-session-reuse.md) | Fix Concurrent-Unconsumed-Query Deadlock in Neo4j Flush | **P0 — DONE, verified** | Low | Confirmed cause + confirmed fix: live repro went from permanent stall to 2792/2792 files in 43s |
 | [002](issues/002-skip-unbuildable-projects.md) | Skip Unbuildable Multi-Platform Target Frameworks | P1 — HIGH | Medium | Eliminates 150+ MSBuild warnings, wasted compilation on broken projects |
 | [003](issues/003-thread-safe-git-cache.md) | Fix Thread-Safety Gap in Git Metadata Cache | P2 — MEDIUM | Trivial | Correctness fix — prevents rare but severe data-race corruption |
 | [001](issues/001-global-using-cache.md) | Eliminate Quadratic Global-Using AST Traversal | **P3 — demoted**, not proven | Low-Medium | Not implicated by profiling evidence — re-justify before implementing |
@@ -17,16 +17,16 @@ This backlog addresses four confirmed performance root causes from the Microsoft
 ## Sequencing Recommendation
 
 1. **Issue 000 — done.** Baseline profiling identified the real root cause.
-2. **Issue 004 first** (concurrent-unconsumed-query deadlock in `FlushSymbols`) — confirmed cause of the observed stall via live dump, low effort, fix ahead of everything else.
+2. **Issue 004 — DONE.** Fixed and verified: live repro against `Controls.Core.csproj` went from a permanent stall (dead at 27/2792 for 20+ min) to completing 2792/2792 files in 43 seconds once the fix and a correctly-created schema were both in place. See `issues/004-neo4j-session-reuse.md` for the full verification writeup, including a second bug found along the way (schema creation errors were silently swallowed, so no indexes/constraints existed on the test DB despite 150k+ accumulated nodes).
 3. **Issue 003 next** (thread-safe git cache) — trivial effort, independent correctness fix.
 4. **Issue 002 next** (skip unbuildable projects) — high UX impact, independent of the others.
 5. **Issue 001 last, and only if still justified** — re-run the baseline repro after Issue 004 lands; only pursue the global-using cache if a *new*, CPU-bound stall pattern emerges. Do not implement on the original complexity argument alone.
 
 ## Success Metrics (Overall)
 
-- Microsoft.Maui.sln ingestion completes to 100% without the multi-minute stall pattern observed in `baseline-metrics.md` (exact end-to-end time target TBD — re-baseline after Issue 004 lands, since the original "90 minutes" figure was set before the real bottleneck was known)
+- **Issue 004 verified**: `Controls.Core.csproj` (2792 files) went from indefinite stall to 100% complete in 43 seconds. Microsoft.Maui.sln full-solution re-run with the fix still needs to happen to confirm the same result at full scale (exact end-to-end time target TBD — re-baseline once run, since the original "90 minutes" figure was set before the real bottleneck was known).
 - Zero thread-safety failures under stress test (10 runs, 32 threads, 10,000 files) — Issue 003
-- Neo4j session open count reduced (secondary goal, Issue 004 AC #4) once the primary deadlock fix is proven safe
+- Neo4j session open count reduced (secondary goal, Issue 004 AC #4) — not yet done, deadlock fix took priority
 - Per-file processing time reduction from Issue 001 — deferred pending re-justification, not currently a tracked metric
 
 ## Architecture Reference
